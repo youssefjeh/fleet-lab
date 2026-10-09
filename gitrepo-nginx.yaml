@@ -1,0 +1,11 @@
+
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: nginx-lab
+  namespace: fleet-local
+spec:
+  repo: https://github.com/TON-USERNAME/TON-REPO
+  branch: main
+  paths:
+    - nginx-lab
