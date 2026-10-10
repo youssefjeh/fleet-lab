@@ -1,0 +1,9 @@
+defaultNamespace: podinfo
+
+helm:
+  repo: https://stefanprodan.github.io/podinfo
+  chart: podinfo
+  version: 6.15.0          # version épinglée
+  releaseName: podinfo
+  values:
+    replicaCount: 2
