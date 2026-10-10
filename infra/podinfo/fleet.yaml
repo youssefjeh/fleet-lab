@@ -6,4 +6,4 @@ helm:
   version: 6.15.0          # version épinglée
   releaseName: podinfo
   values:
-    replicaCount: 2
+    replicaCount: 3
