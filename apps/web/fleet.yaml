@@ -1,4 +1,4 @@
 defaultNamespace: web
 
 kustomize:
-  dir: overlays/dev
+  dir: overlays/prod
