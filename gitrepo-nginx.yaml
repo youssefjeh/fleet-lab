@@ -10,3 +10,4 @@ spec:
   paths:
     - nginx-lab
     - infra/podinfo
+    - apps/web
