@@ -5,7 +5,7 @@ metadata:
   name: nginx-lab
   namespace: fleet-local
 spec:
-  repo: https://github.com/TON-USERNAME/TON-REPO
+  repo: https://github.com/youssefjeh/fleet-lab
   branch: main
   paths:
     - nginx-lab
