@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # ==========================================================
-# Prerequis Kubernetes + k3d + Helm + Fleet
+# Prerequis Kubernetes + k3d + Helm + Fleet + Fleet CLI
 # Compatible Ubuntu
 # À exécuter en root : bash prerequis.sh
 # ==========================================================
@@ -19,33 +19,57 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 
+# Architecture commune (kubectl, fleet CLI)
+ARCH="$(dpkg --print-architecture)"
+case "$ARCH" in
+  amd64|arm64) ;;
+  *)
+    echo "Architecture non prise en charge : $ARCH"
+    exit 1
+    ;;
+esac
+
 echo "=========================================="
-echo " 1/8 - Installation des paquets système"
+echo " 1/9 - Installation des paquets système"
 echo "=========================================="
 apt-get update
 apt-get install -y \
   ca-certificates curl bash-completion tar gzip
 
 echo "=========================================="
-echo " 2/8 - Installation de Docker"
+echo " 2/9 - Installation de Docker"
 echo "=========================================="
+if ! command -v docker >/dev/null 2>&1; then
+  # Retirer d'éventuels paquets Docker non officiels qui entreraient en conflit
+  for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
+    apt-get remove -y "$pkg" >/dev/null 2>&1 || true
+  done
 
-# Utiliser le dépôt officiel Docker
-apt-get update
-apt-get install -y \
-  docker-ce \
-  docker-ce-cli \
-  containerd.io \
-  docker-buildx-plugin \
-  docker-compose-plugin
+  # Clé GPG officielle Docker
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+
+  # Dépôt officiel Docker (jammy est détecté automatiquement)
+  . /etc/os-release
+  echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/ubuntu ${UBUNTU_CODENAME:-$VERSION_CODENAME} stable" \
+    > /etc/apt/sources.list.d/docker.list
+
+  apt-get update
+  apt-get install -y \
+    docker-ce docker-ce-cli containerd.io \
+    docker-buildx-plugin docker-compose-plugin
+fi
 
 systemctl enable --now docker
-
 docker --version
 docker info >/dev/null
 echo "Docker est opérationnel."
+
 echo "=========================================="
-echo " 3/8 - Installation de k3d"
+echo " 3/9 - Installation de k3d"
 echo "=========================================="
 if ! command -v k3d >/dev/null 2>&1; then
   curl -fsSL \
@@ -57,28 +81,18 @@ fi
 k3d version
 
 echo "=========================================="
-echo " 4/8 - Installation de kubectl"
+echo " 4/9 - Installation de kubectl"
 echo "=========================================="
 if ! command -v kubectl >/dev/null 2>&1; then
-  ARCH="$(dpkg --print-architecture)"
-  case "$ARCH" in
-    amd64) KUBECTL_ARCH="amd64" ;;
-    arm64) KUBECTL_ARCH="arm64" ;;
-    *)
-      echo "Architecture non prise en charge : $ARCH"
-      exit 1
-      ;;
-  esac
-
   KUBECTL_VERSION="$(
     curl -fsSL https://dl.k8s.io/release/stable.txt
   )"
 
   curl -fsSLo /tmp/kubectl \
-    "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl"
+    "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl"
 
   curl -fsSLo /tmp/kubectl.sha256 \
-    "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl.sha256"
+    "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl.sha256"
 
   echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum --check
   install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
@@ -87,7 +101,7 @@ fi
 kubectl version --client
 
 echo "=========================================="
-echo " 5/8 - Installation de Helm 3"
+echo " 5/9 - Installation de Helm 3"
 echo "=========================================="
 if ! command -v helm >/dev/null 2>&1; then
   curl -fsSL \
@@ -99,7 +113,7 @@ fi
 helm version
 
 echo "=========================================="
-echo " 6/8 - Création du cluster k3d"
+echo " 6/9 - Création du cluster k3d"
 echo "=========================================="
 if k3d cluster list | awk 'NR > 1 {print $1}' | grep -Fxq "$CLUSTER_NAME"; then
   echo "Le cluster ${CLUSTER_NAME} existe déjà : on le conserve."
@@ -112,7 +126,7 @@ kubectl wait --for=condition=Ready node --all --timeout=180s
 kubectl get nodes
 
 echo "=========================================="
-echo " 7/8 - Installation de Fleet avec Helm"
+echo " 7/9 - Installation de Fleet avec Helm"
 echo "=========================================="
 
 # Ajouter le dépôt Helm de Fleet et actualiser les index
@@ -134,7 +148,33 @@ helm upgrade --install fleet fleet/fleet \
   --timeout 5m
 
 echo "=========================================="
-echo " 8/8 - Activation de l'autocomplétion Bash"
+echo " 8/9 - Installation du Fleet CLI"
+echo "=========================================="
+if ! command -v fleet >/dev/null 2>&1; then
+  # Aligner la version du CLI sur celle du contrôleur Fleet déployé
+  # (image rancher/fleet:vX.Y.Z). Repli sur "latest" si introuvable.
+  FLEET_IMAGE="$(
+    kubectl get deploy fleet-controller -n "$FLEET_NAMESPACE" \
+      -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true
+  )"
+  FLEET_TAG="${FLEET_IMAGE##*:}"
+
+  if [[ "$FLEET_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    FLEET_CLI_URL="https://github.com/rancher/fleet/releases/download/${FLEET_TAG}/fleet-linux-${ARCH}"
+    echo "Version du contrôleur détectée : ${FLEET_TAG}"
+  else
+    FLEET_CLI_URL="https://github.com/rancher/fleet/releases/latest/download/fleet-linux-${ARCH}"
+    echo "Version du contrôleur non détectée : utilisation de la dernière release."
+  fi
+
+  curl -fsSL -o /tmp/fleet "$FLEET_CLI_URL"
+  install -o root -g root -m 0755 /tmp/fleet /usr/local/bin/fleet
+  rm -f /tmp/fleet
+fi
+fleet --version
+
+echo "=========================================="
+echo " 9/9 - Activation de l'autocomplétion Bash"
 echo "=========================================="
 
 BASHRC="/root/.bashrc"
@@ -154,6 +194,10 @@ if [[ $- == *i* ]]; then
   if command -v helm >/dev/null 2>&1; then
     source <(helm completion bash)
   fi
+
+  if command -v fleet >/dev/null 2>&1; then
+    source <(fleet completion bash 2>/dev/null) || true
+  fi
 fi
 # <<< Kubernetes CLI completion <<<
 BASHRC_EOF
@@ -169,6 +213,7 @@ docker --version
 k3d version
 kubectl version --client
 helm version
+fleet --version
 
 echo
 echo "Nœuds Kubernetes :"
