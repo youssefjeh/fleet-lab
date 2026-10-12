@@ -1,4 +1,12 @@
 defaultNamespace: web
 
 kustomize:
-  dir: overlays/prod
+  dir: overlays/dev            # par défaut : dev
+
+targetCustomizations:
+  - name: prod
+    clusterSelector:
+      matchLabels:
+        env: prod
+    kustomize:
+      dir: overlays/prod       # consigne particulière pour le badge env: prod
