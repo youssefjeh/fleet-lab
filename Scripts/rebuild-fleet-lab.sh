@@ -10,10 +10,15 @@
 #    4. Apps         : GitRepo "nginx-lab" (LAB 1 / 2-a / 2-b) sur fleet-mgmt
 #    5. Enregistrement (LAB 3-b) : fleet-dev et fleet-prod présentés au chef
 #                       (mode manager-initiated : kubeconfig -> Secret -> Cluster)
+#    6. Ciblage (LAB 3-c) : ClusterGroup "production" + GitRepo "fleet-lab"
+#    7. Rancher (LAB 5a) : cluster neuf "rancher-mgmt" + cert-manager + Rancher
 #
 #  Usage :
-#    ./rebuild-fleet-lab.sh            # tout
-#    ./rebuild-fleet-lab.sh --no-tools # sauter l'étape 0 (outils déjà là)
+#    ./rebuild-fleet-lab.sh               # tout
+#    ./rebuild-fleet-lab.sh --no-tools    # sauter l'étape 0 (outils déjà là)
+#    ./rebuild-fleet-lab.sh --no-rancher  # sauter l'étape 7 (Rancher est lourd)
+#    ./rebuild-fleet-lab.sh --only-rancher # seulement l'étape 7
+#    (les options se combinent : --no-tools --only-rancher)
 #
 #  Le script est rejouable : ce qui existe déjà est conservé.
 #  Prévu pour Ubuntu, lancé en root (playground KodeKloud).
@@ -28,8 +33,24 @@ NETWORK="fleet-net"
 MGMT="fleet-mgmt"
 TARGETS=("fleet-dev:dev" "fleet-prod:prod")   # "<cluster k3d>:<nom Fleet + label env>"
 
+# Rancher (LAB 5a) — versions épinglées (vérifiées compatibles : Rancher 2.15.2 accepte k8s < 1.37)
+RANCHER_CLUSTER="rancher-mgmt"
+RANCHER_HOSTNAME="rancher.localhost"
+RANCHER_BOOTSTRAP_PASSWORD="admin"
+RANCHER_VERSION="2.15.2"
+CERT_MANAGER_VERSION="v1.21.2"
+
 INSTALL_TOOLS=true
-[[ "${1:-}" == "--no-tools" ]] && INSTALL_TOOLS=false
+RUN_FLEET=true
+RUN_RANCHER=true
+for arg in "$@"; do
+  case "$arg" in
+    --no-tools)     INSTALL_TOOLS=false ;;
+    --no-rancher)   RUN_RANCHER=false ;;
+    --only-rancher) RUN_FLEET=false ;;
+    *) echo "Option inconnue : $arg (options : --no-tools --no-rancher --only-rancher)"; exit 1 ;;
+  esac
+done
 
 # ---------- Affichage --------------------------------------------------------
 step() { echo; echo "==================== $* ===================="; }
@@ -271,18 +292,138 @@ EOF
 }
 
 # =============================================================================
+# 6. LAB 3-c — Cibler par labels : ClusterGroup "production" + GitRepo "fleet-lab"
+#    Le GitRepo est dans le namespace "clusters" : il ne voit que dev et prod.
+# =============================================================================
+apply_targeting() {
+  step "6. Ciblage (ClusterGroup + GitRepo fleet-lab)"
+  local ctx="k3d-$MGMT"
+
+  kubectl --context "$ctx" apply -f - >/dev/null <<'EOF'
+apiVersion: fleet.cattle.io/v1alpha1
+kind: ClusterGroup
+metadata:
+  name: production
+  namespace: clusters
+spec:
+  selector:
+    matchLabels:
+      env: prod
+EOF
+  ok "ClusterGroup 'production' (env=prod)"
+
+  kubectl --context "$ctx" apply -f - >/dev/null <<EOF
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: fleet-lab
+  namespace: clusters
+spec:
+  repo: ${REPO_URL}
+  branch: main
+  paths:
+    - apps
+    - infra
+  targets:
+    - name: dev
+      clusterSelector:
+        matchLabels:
+          env: dev
+    - name: prod
+      clusterGroup: production
+EOF
+  ok "GitRepo 'fleet-lab' (dev par badge, prod par équipe)"
+
+  kubectl --context "$ctx" get clustergroups,gitrepo -n clusters
+}
+
+# =============================================================================
+# 7. LAB 5a — Rancher sur un cluster NEUF (pas sur le Fleet standalone)
+#    Rancher embarque son propre Fleet : on ne l'installe jamais sur fleet-mgmt.
+#    -p 443:443@loadbalancer : le port 443 de la machine -> ingress (Traefik) du cluster
+# =============================================================================
+install_rancher() {
+  step "7. Rancher sur $RANCHER_CLUSTER"
+  local ctx="k3d-$RANCHER_CLUSTER"
+
+  if k3d cluster get "$RANCHER_CLUSTER" >/dev/null 2>&1; then
+    ok "cluster $RANCHER_CLUSTER existe déjà"
+  else
+    info "création du cluster $RANCHER_CLUSTER (port 443 exposé)"
+    k3d cluster create "$RANCHER_CLUSTER" \
+      --network "$NETWORK" \
+      -p "443:443@loadbalancer" \
+      --k3s-arg "--tls-san=k3d-${RANCHER_CLUSTER}-server-0@server:0" >/dev/null
+    ok "cluster $RANCHER_CLUSTER créé"
+  fi
+
+  # 7.1 cert-manager : fabrique les certificats HTTPS de Rancher
+  helm repo add jetstack https://charts.jetstack.io >/dev/null 2>&1 || true
+  helm repo add rancher-latest https://releases.rancher.com/server-charts/latest >/dev/null 2>&1 || true
+  helm repo update jetstack rancher-latest >/dev/null
+
+  helm upgrade --install --wait --kube-context "$ctx" \
+    cert-manager jetstack/cert-manager \
+    -n cert-manager --create-namespace \
+    --version "$CERT_MANAGER_VERSION" \
+    --set crds.enabled=true >/dev/null
+  ok "cert-manager $CERT_MANAGER_VERSION installé"
+
+  # 7.2 Rancher
+  helm upgrade --install --kube-context "$ctx" \
+    rancher rancher-latest/rancher \
+    -n cattle-system --create-namespace \
+    --version "$RANCHER_VERSION" \
+    --set hostname="$RANCHER_HOSTNAME" \
+    --set bootstrapPassword="$RANCHER_BOOTSTRAP_PASSWORD" \
+    --set replicas=1 >/dev/null
+  ok "chart Rancher $RANCHER_VERSION installé"
+
+  info "attente du démarrage de Rancher (jusqu'à 10 min)..."
+  if kubectl --context "$ctx" -n cattle-system rollout status deploy/rancher --timeout=600s; then
+    ok "Rancher est démarré"
+  else
+    echo "  [!] Rancher n'est pas encore prêt. Diagnostic :"
+    echo "      kubectl --context $ctx -n cattle-system get pods"
+    echo "      kubectl --context $ctx -n cattle-system logs deploy/rancher --tail=30"
+  fi
+
+  # 7.3 test : Rancher répond "pong" sur /ping
+  local pong
+  pong="$(curl -sk --max-time 10 --resolve "${RANCHER_HOSTNAME}:443:127.0.0.1" \
+          "https://${RANCHER_HOSTNAME}/ping" || true)"
+  if [[ "$pong" == "pong" ]]; then
+    ok "https://${RANCHER_HOSTNAME}/ping -> pong"
+  else
+    echo "  [!] /ping ne répond pas encore 'pong' (réponse : '${pong:-vide}'). Réessaie dans 1-2 min :"
+    echo "      curl -k --resolve ${RANCHER_HOSTNAME}:443:127.0.0.1 https://${RANCHER_HOSTNAME}/ping"
+  fi
+}
+
+# =============================================================================
 # Résumé
 # =============================================================================
 summary() {
   step "Terminé"
-  kubectl config use-context "k3d-$MGMT" >/dev/null
-  echo "Contexte actif : $(kubectl config current-context)  (le chef)"
-  echo
-  echo "Vérifications utiles :"
-  echo "  kubectl get gitrepo,bundle -n fleet-local"
-  echo "  kubectl get clusters.fleet.cattle.io -A"
-  echo "  kubectl --context k3d-fleet-dev  get pods -n cattle-fleet-system"
-  echo "  kubectl --context k3d-fleet-prod get pods -n cattle-fleet-system"
+  if $RUN_FLEET; then
+    kubectl config use-context "k3d-$MGMT" >/dev/null
+    echo "Contexte actif : $(kubectl config current-context)  (le chef Fleet standalone)"
+    echo
+    echo "Vérifications Fleet :"
+    echo "  kubectl get gitrepo,bundle -n fleet-local"
+    echo "  kubectl get clusters.fleet.cattle.io -A --show-labels"
+    echo "  kubectl get clustergroups,gitrepo,bundles -n clusters"
+    echo "  kubectl --context k3d-fleet-dev  get pods -A"
+    echo "  kubectl --context k3d-fleet-prod get pods -A"
+  fi
+  if $RUN_RANCHER; then
+    echo
+    echo "Rancher :"
+    echo "  URL          : https://${RANCHER_HOSTNAME}"
+    echo "  Utilisateur  : admin"
+    echo "  Mot de passe : ${RANCHER_BOOTSTRAP_PASSWORD}  (à changer à la 1re connexion)"
+    echo "  Contexte     : kubectl --context k3d-${RANCHER_CLUSTER} get pods -n cattle-system"
+  fi
   echo
   echo "Fichiers sensibles (ne pas commiter) : $WORK_DIR"
 }
@@ -290,8 +431,12 @@ summary() {
 # =============================================================================
 $INSTALL_TOOLS && install_tools
 create_network
-create_clusters
-install_fleet
-apply_gitrepo
-register_targets
+if $RUN_FLEET; then
+  create_clusters
+  install_fleet
+  apply_gitrepo
+  register_targets
+  apply_targeting
+fi
+$RUN_RANCHER && install_rancher
 summary
