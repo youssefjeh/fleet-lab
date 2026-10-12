@@ -433,6 +433,52 @@ spec:
 EOF
 }
 
+# Attendre qu'un cluster tout neuf soit vraiment prêt avant d'y installer quoi que ce soit.
+# Juste après "k3d cluster create", l'API server répond, mais il est encore très occupé
+# (téléchargement des images, démarrage de CoreDNS, Traefik, metrics-server...). Une
+# installation Helm lancée à ce moment peut échouer avec :
+#   "Timeout: request did not complete within requested timeout - context deadline exceeded"
+wait_cluster_ready() {
+  local ctx="$1" d
+  info "attente que le cluster ${ctx#k3d-} soit prêt..."
+  kubectl --context "$ctx" wait --for=condition=Ready nodes --all --timeout=300s >/dev/null
+  for d in coredns local-path-provisioner metrics-server; do
+    kubectl --context "$ctx" -n kube-system rollout status "deploy/$d" --timeout=300s >/dev/null 2>&1 || true
+  done
+  for _ in $(seq 1 30); do
+    [[ "$(kubectl --context "$ctx" get --raw /readyz 2>/dev/null)" == "ok" ]] && break
+    sleep 5
+  done
+  ok "cluster ${ctx#k3d-} prêt"
+}
+
+# helm upgrade --install avec réessais.
+# Si une release est restée en état "failed" ou "pending-*" (installation interrompue),
+# on la désinstalle avant de réessayer : sinon Helm refuse de la mettre à jour.
+# Usage : helm_retry <contexte> <release> <namespace> <chart et options helm...>
+helm_retry() {
+  local ctx="$1" rel="$2" ns="$3" attempt status
+  shift 3
+  for attempt in 1 2 3; do
+    status="$(helm status "$rel" -n "$ns" --kube-context "$ctx" -o json 2>/dev/null \
+              | grep -o '"status":"[a-z-]*"' | head -1 | cut -d'"' -f4 || true)"
+    if [[ "$status" == "failed" || "$status" == pending-* ]]; then
+      info "release $rel en état '$status' : désinstallation avant nouvel essai"
+      helm uninstall "$rel" -n "$ns" --kube-context "$ctx" --wait >/dev/null 2>&1 || true
+    fi
+    if helm upgrade --install "$rel" "$@" \
+         -n "$ns" --create-namespace --kube-context "$ctx" --timeout 10m >/dev/null; then
+      return 0
+    fi
+    info "échec de l'installation de $rel (essai $attempt/3), nouvel essai dans 20 s..."
+    sleep 20
+  done
+  echo "  [!] Impossible d'installer $rel après 3 essais. Diagnostic :"
+  echo "      helm list -A -a --kube-context $ctx"
+  echo "      kubectl --context $ctx get pods -A"
+  return 1
+}
+
 install_rancher() {
   step "7. Rancher sur $RANCHER_CLUSTER"
   local ctx="k3d-$RANCHER_CLUSTER"
@@ -454,17 +500,17 @@ install_rancher() {
       --k3s-arg "--tls-san=k3d-${RANCHER_CLUSTER}-server-0@server:0" >/dev/null
     ok "cluster $RANCHER_CLUSTER créé"
   fi
+  wait_cluster_ready "$ctx"
 
   # 7.1 cert-manager : fabrique les certificats HTTPS de Rancher
   helm repo add jetstack https://charts.jetstack.io >/dev/null 2>&1 || true
   helm repo add rancher-latest https://releases.rancher.com/server-charts/latest >/dev/null 2>&1 || true
   helm repo update jetstack rancher-latest >/dev/null
 
-  helm upgrade --install --wait --kube-context "$ctx" \
-    cert-manager jetstack/cert-manager \
-    -n cert-manager --create-namespace \
+  helm_retry "$ctx" cert-manager cert-manager \
+    jetstack/cert-manager --wait \
     --version "$CERT_MANAGER_VERSION" \
-    --set crds.enabled=true >/dev/null
+    --set crds.enabled=true
   ok "cert-manager $CERT_MANAGER_VERSION installé"
 
   # 7.2 Rancher
@@ -473,15 +519,14 @@ install_rancher() {
   #   déjà conteneurisé (KodeKloud + k3d = conteneurs dans des conteneurs), cette copie
   #   est refusée -> "[FATAL] error running the jail command: exit status 2" -> CrashLoopBackOff.
   #   Avec CATTLE_DEV_MODE, Rancher saute cette étape. LAB UNIQUEMENT, jamais en production.
-  helm upgrade --install --kube-context "$ctx" \
-    rancher rancher-latest/rancher \
-    -n cattle-system --create-namespace \
+  helm_retry "$ctx" rancher cattle-system \
+    rancher-latest/rancher \
     --version "$RANCHER_VERSION" \
     --set hostname="$RANCHER_HOSTNAME" \
     --set-string bootstrapPassword="$RANCHER_BOOTSTRAP_PASSWORD" \
     --set replicas=1 \
     --set 'extraEnv[0].name=CATTLE_DEV_MODE' \
-    --set-string 'extraEnv[0].value=30' >/dev/null
+    --set-string 'extraEnv[0].value=30'
   ok "chart Rancher $RANCHER_VERSION installé"
 
   info "attente du démarrage de Rancher (jusqu'à 10 min)..."
