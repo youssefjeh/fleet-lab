@@ -479,6 +479,19 @@ helm_retry() {
   return 1
 }
 
+# Si le verrou de leader de Rancher appartient à un pod qui n'existe plus,
+# le supprimer : le pod Rancher actuel le reprend aussitôt et devient leader.
+fix_orphan_rancher_lease() {
+  local ctx="$1" holder
+  holder="$(kubectl --context "$ctx" -n kube-system get lease cattle-controllers \
+            -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
+  [[ -z "$holder" ]] && return 0
+  if ! kubectl --context "$ctx" -n cattle-system get pod "$holder" >/dev/null 2>&1; then
+    info "verrou de leader orphelin (pod '$holder' disparu) : suppression"
+    kubectl --context "$ctx" -n kube-system delete lease cattle-controllers >/dev/null 2>&1 || true
+  fi
+}
+
 install_rancher() {
   step "7. Rancher sur $RANCHER_CLUSTER"
   local ctx="k3d-$RANCHER_CLUSTER"
@@ -561,9 +574,33 @@ install_rancher() {
     -p '{"value":"false"}' >/dev/null 2>&1 || info "setting first-login introuvable (sans gravité)"
   ok "server-url = $(kubectl --context "$ctx" get settings.management.cattle.io server-url -o jsonpath='{.value}')"
 
-  kubectl --context "$ctx" -n cattle-system rollout restart deploy/rancher >/dev/null
-  kubectl --context "$ctx" -n cattle-system rollout status deploy/rancher --timeout=600s >/dev/null
-  ok "Rancher redémarré avec ses réglages"
+  # PAS de "rollout restart" ici : Rancher relit ses settings à chaud.
+  # Un redémarrage à ce moment tue le pod "leader" en plein travail (téléchargement
+  # de rancher-charts) ; son verrou de leader (Lease kube-system/cattle-controllers)
+  # reste alors bloqué au nom d'un pod disparu, et le nouveau pod attend indéfiniment :
+  #   "Attempting to acquire leader lease..." -> pas de webhook, pas de Fleet,
+  #   cluster "local" Unavailable.
+  fix_orphan_rancher_lease "$ctx"
+
+  # Attendre l'installation des composants système par Rancher (webhook + Fleet)
+  info "attente de l'installation de rancher-webhook et de Fleet par Rancher (jusqu'à 15 min)..."
+  local ready=false
+  for _ in $(seq 1 90); do
+    if kubectl --context "$ctx" -n cattle-system get deploy rancher-webhook >/dev/null 2>&1 \
+       && kubectl --context "$ctx" -n cattle-fleet-system get deploy fleet-controller >/dev/null 2>&1; then
+      ready=true; break
+    fi
+    # filet de sécurité : si le verrou redevient orphelin, on le libère
+    fix_orphan_rancher_lease "$ctx"
+    sleep 10
+  done
+  if $ready; then
+    ok "rancher-webhook et Fleet installés par Rancher"
+  else
+    echo "  [!] webhook / Fleet pas encore installés. Diagnostic :"
+    echo "      kubectl --context $ctx get clusterrepos"
+    echo "      kubectl --context $ctx -n kube-system get lease cattle-controllers -o jsonpath='{.spec.holderIdentity}'"
+  fi
 
   # 7.5 test : par le même chemin que le navigateur (VM:30080 -> proxy -> Rancher)
   local pong="" code=""
