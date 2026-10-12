@@ -3,7 +3,26 @@ defaultNamespace: podinfo
 helm:
   repo: https://stefanprodan.github.io/podinfo
   chart: podinfo
-  version: 6.15.0          # version épinglée
+  version: 6.15.0
   releaseName: podinfo
   values:
-    replicaCount: 3
+    replicaCount: 1
+
+targetCustomizations:
+  - name: prod-casa              # LE PLUS PRÉCIS EN HAUT
+    clusterSelector:
+      matchLabels:               # plusieurs labels = ET
+        env: prod
+        region: casa
+    helm:
+      values:
+        replicaCount: 3
+        ui:
+          message: "prod Casablanca"
+  - name: prod                   # le plus général en dessous
+    clusterSelector:
+      matchLabels:
+        env: prod
+    helm:
+      values:
+        replicaCount: 2
