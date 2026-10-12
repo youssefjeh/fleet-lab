@@ -1,0 +1,9 @@
+apiVersion: fleet.cattle.io/v1alpha1
+kind: ClusterGroup
+metadata:
+  name: production
+  namespace: clusters        # même tiroir que les fiches Cluster
+spec:
+  selector:
+    matchLabels:
+      env: prod              # l'équipe = tous les clusters avec ce badge

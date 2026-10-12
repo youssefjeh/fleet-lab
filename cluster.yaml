@@ -1,0 +1,19 @@
+apiVersion: fleet.cattle.io/v1alpha1
+kind: Cluster
+metadata:
+  name: dev
+  namespace: clusters
+  labels:
+    env: dev                         # le badge
+spec:
+  kubeConfigSecret: dev-kubeconfig   # "la clé est dans ce coffre"
+---
+apiVersion: fleet.cattle.io/v1alpha1
+kind: Cluster
+metadata:
+  name: prod
+  namespace: clusters
+  labels:
+    env: prod
+spec:
+  kubeConfigSecret: prod-kubeconfig

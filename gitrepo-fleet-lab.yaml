@@ -1,0 +1,18 @@
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: fleet-lab
+  namespace: clusters        # ⚠️ même namespace que les Clusters !
+spec:
+  repo: https://github.com/youssefjeh/fleet-lab
+  branch: main
+  paths:
+    - apps                   # Fleet trouve apps/web/fleet.yaml
+    - infra                  # Fleet trouve infra/podinfo/fleet.yaml
+  targets:
+    - name: dev
+      clusterSelector:       # choisir par badge, directement
+        matchLabels:
+          env: dev
+    - name: prod
+      clusterGroup: production   # choisir par équipe
