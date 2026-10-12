@@ -12,13 +12,19 @@
 #                       (mode manager-initiated : kubeconfig -> Secret -> Cluster)
 #    6. Ciblage (LAB 3-c) : ClusterGroup "production" + GitRepo "fleet-lab"
 #    7. Rancher (LAB 5a) : cluster neuf "rancher-mgmt" + cert-manager + Rancher
+#                          + proxy nginx (accès UI via "View Port" KodeKloud 30080)
+#                          + server-url joignable par les clusters importés
 #
 #  Usage :
 #    ./rebuild-fleet-lab.sh               # tout
 #    ./rebuild-fleet-lab.sh --no-tools    # sauter l'étape 0 (outils déjà là)
 #    ./rebuild-fleet-lab.sh --no-rancher  # sauter l'étape 7 (Rancher est lourd)
-#    ./rebuild-fleet-lab.sh --only-rancher # seulement l'étape 7
+#    ./rebuild-fleet-lab.sh --only-rancher # module 5 : Rancher + fleet-dev / fleet-prod VIDES
+#                                          # (à importer dans Rancher, sans Fleet standalone)
 #    (les options se combinent : --no-tools --only-rancher)
+#
+#  ⚠️ Module 5 : utiliser --only-rancher sur un playground neuf. Un cluster ne doit
+#     avoir qu'UN seul chef Fleet : soit le Fleet standalone (fleet-mgmt), soit Rancher.
 #
 #  Le script est rejouable : ce qui existe déjà est conservé.
 #  Prévu pour Ubuntu, lancé en root (playground KodeKloud).
@@ -36,9 +42,13 @@ TARGETS=("fleet-dev:dev" "fleet-prod:prod")   # "<cluster k3d>:<nom Fleet + labe
 # Rancher (LAB 5a) — versions épinglées (vérifiées compatibles : Rancher 2.15.2 accepte k8s < 1.37)
 RANCHER_CLUSTER="rancher-mgmt"
 RANCHER_HOSTNAME="rancher.localhost"
-RANCHER_BOOTSTRAP_PASSWORD="admin"
+RANCHER_BOOTSTRAP_PASSWORD='Admin123!Fleet'     # >= 12 caractères (exigence Rancher)
 RANCHER_VERSION="2.15.2"
 CERT_MANAGER_VERSION="v1.21.2"
+RANCHER_PROXY_PORT="30080"                      # NodePort du proxy nginx = port "View Port"
+# Adresse que les clusters importés utilisent pour appeler Rancher (réseau fleet-net).
+# En http : le formulaire Rancher l'interdit, kubectl patch l'accepte (LAB uniquement).
+RANCHER_SERVER_URL="http://k3d-${RANCHER_CLUSTER}-server-0:${RANCHER_PROXY_PORT}"
 
 INSTALL_TOOLS=true
 RUN_FLEET=true
@@ -340,19 +350,107 @@ EOF
 # =============================================================================
 # 7. LAB 5a — Rancher sur un cluster NEUF (pas sur le Fleet standalone)
 #    Rancher embarque son propre Fleet : on ne l'installe jamais sur fleet-mgmt.
-#    -p 443:443@loadbalancer : le port 443 de la machine -> ingress (Traefik) du cluster
+#
+#    Accès à l'interface sur KodeKloud ("View Port") :
+#      navigateur --HTTPS--> KodeKloud --HTTP--> VM:30080 --> serverlb k3d
+#        --> NodePort 30080 --> proxy nginx (pod) --HTTPS--> service rancher
+#    Le proxy ajoute "X-Forwarded-Proto: https" : sans lui, Rancher redirige
+#    sans fin vers https (ERR_TOO_MANY_REDIRECTS), car KodeKloud lui parle en HTTP.
 # =============================================================================
+rancher_proxy_manifest() {
+  # Heredoc entre quotes : les $ de nginx ne sont pas interprétés par bash.
+  cat <<'EOF' | sed "s/__NODEPORT__/${RANCHER_PROXY_PORT}/"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rancher-proxy-config
+  namespace: cattle-system
+data:
+  default.conf: |
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+    server {
+        listen 80;
+        location / {
+            proxy_pass https://rancher.cattle-system.svc.cluster.local;
+            proxy_ssl_verify off;
+            proxy_http_version 1.1;
+            proxy_set_header Host              $host;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            # websockets : interface en direct + tunnel des agents des clusters importés
+            proxy_set_header Upgrade           $http_upgrade;
+            proxy_set_header Connection        $connection_upgrade;
+            proxy_read_timeout 900s;
+            proxy_buffering    off;
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rancher-http-proxy
+  namespace: cattle-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rancher-http-proxy
+  template:
+    metadata:
+      labels:
+        app: rancher-http-proxy
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+      volumes:
+        - name: config
+          configMap:
+            name: rancher-proxy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rancher-http-proxy
+  namespace: cattle-system
+spec:
+  type: NodePort
+  selector:
+    app: rancher-http-proxy
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: __NODEPORT__
+EOF
+}
+
 install_rancher() {
   step "7. Rancher sur $RANCHER_CLUSTER"
   local ctx="k3d-$RANCHER_CLUSTER"
 
+  # 7.0 cluster : 443 (ingress) + 30080 (proxy pour "View Port") ouverts sur la VM
   if k3d cluster get "$RANCHER_CLUSTER" >/dev/null 2>&1; then
     ok "cluster $RANCHER_CLUSTER existe déjà"
+    if ! docker port "k3d-${RANCHER_CLUSTER}-serverlb" 2>/dev/null | grep -q "^${RANCHER_PROXY_PORT}/tcp"; then
+      info "ouverture du port ${RANCHER_PROXY_PORT} sur le load balancer k3d"
+      k3d node edit "k3d-${RANCHER_CLUSTER}-serverlb" \
+        --port-add "${RANCHER_PROXY_PORT}:${RANCHER_PROXY_PORT}" >/dev/null
+    fi
   else
-    info "création du cluster $RANCHER_CLUSTER (port 443 exposé)"
+    info "création du cluster $RANCHER_CLUSTER (ports 443 et ${RANCHER_PROXY_PORT} exposés)"
     k3d cluster create "$RANCHER_CLUSTER" \
       --network "$NETWORK" \
       -p "443:443@loadbalancer" \
+      -p "${RANCHER_PROXY_PORT}:${RANCHER_PROXY_PORT}@loadbalancer" \
       --k3s-arg "--tls-san=k3d-${RANCHER_CLUSTER}-server-0@server:0" >/dev/null
     ok "cluster $RANCHER_CLUSTER créé"
   fi
@@ -370,13 +468,20 @@ install_rancher() {
   ok "cert-manager $CERT_MANAGER_VERSION installé"
 
   # 7.2 Rancher
+  #   CATTLE_DEV_MODE : au démarrage, Rancher prépare une "jail" (/usr/bin/jailer.sh)
+  #   qui recopie des fichiers de périphériques (/dev) avec tar. Dans un playground
+  #   déjà conteneurisé (KodeKloud + k3d = conteneurs dans des conteneurs), cette copie
+  #   est refusée -> "[FATAL] error running the jail command: exit status 2" -> CrashLoopBackOff.
+  #   Avec CATTLE_DEV_MODE, Rancher saute cette étape. LAB UNIQUEMENT, jamais en production.
   helm upgrade --install --kube-context "$ctx" \
     rancher rancher-latest/rancher \
     -n cattle-system --create-namespace \
     --version "$RANCHER_VERSION" \
     --set hostname="$RANCHER_HOSTNAME" \
-    --set bootstrapPassword="$RANCHER_BOOTSTRAP_PASSWORD" \
-    --set replicas=1 >/dev/null
+    --set-string bootstrapPassword="$RANCHER_BOOTSTRAP_PASSWORD" \
+    --set replicas=1 \
+    --set 'extraEnv[0].name=CATTLE_DEV_MODE' \
+    --set-string 'extraEnv[0].value=30' >/dev/null
   ok "chart Rancher $RANCHER_VERSION installé"
 
   info "attente du démarrage de Rancher (jusqu'à 10 min)..."
@@ -385,19 +490,64 @@ install_rancher() {
   else
     echo "  [!] Rancher n'est pas encore prêt. Diagnostic :"
     echo "      kubectl --context $ctx -n cattle-system get pods"
-    echo "      kubectl --context $ctx -n cattle-system logs deploy/rancher --tail=30"
+    echo "      kubectl --context $ctx -n cattle-system logs deploy/rancher --previous --tail=30"
+    return 1
   fi
 
-  # 7.3 test : Rancher répond "pong" sur /ping
-  local pong
-  pong="$(curl -sk --max-time 10 --resolve "${RANCHER_HOSTNAME}:443:127.0.0.1" \
-          "https://${RANCHER_HOSTNAME}/ping" || true)"
-  if [[ "$pong" == "pong" ]]; then
-    ok "https://${RANCHER_HOSTNAME}/ping -> pong"
+  # 7.3 proxy nginx dans le cluster (stable, contrairement à un kubectl port-forward)
+  rancher_proxy_manifest | kubectl --context "$ctx" apply -f - >/dev/null
+  kubectl --context "$ctx" -n cattle-system rollout status deploy/rancher-http-proxy --timeout=180s >/dev/null
+  ok "proxy nginx exposé sur le NodePort ${RANCHER_PROXY_PORT}"
+
+  # 7.4 réglages Rancher (comme le lab KodeKloud "Deploy Rancher") :
+  #   - server-url : adresse que les clusters importés utiliseront (réseau fleet-net)
+  #   - first-login=false : pas d'assistant de 1re connexion (il écraserait server-url
+  #     et refuse le http)
+  #   Les settings existent quelques secondes après le démarrage : on réessaie.
+  local _
+  for _ in $(seq 1 30); do
+    if kubectl --context "$ctx" patch settings.management.cattle.io server-url --type=merge \
+         -p "{\"value\":\"${RANCHER_SERVER_URL}\"}" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 5
+  done
+  kubectl --context "$ctx" patch settings.management.cattle.io first-login --type=merge \
+    -p '{"value":"false"}' >/dev/null 2>&1 || info "setting first-login introuvable (sans gravité)"
+  ok "server-url = $(kubectl --context "$ctx" get settings.management.cattle.io server-url -o jsonpath='{.value}')"
+
+  kubectl --context "$ctx" -n cattle-system rollout restart deploy/rancher >/dev/null
+  kubectl --context "$ctx" -n cattle-system rollout status deploy/rancher --timeout=600s >/dev/null
+  ok "Rancher redémarré avec ses réglages"
+
+  # 7.5 test : par le même chemin que le navigateur (VM:30080 -> proxy -> Rancher)
+  local pong="" code=""
+  for _ in $(seq 1 24); do
+    pong="$(curl -s --max-time 5 "http://127.0.0.1:${RANCHER_PROXY_PORT}/ping" || true)"
+    [[ "$pong" == "pong" ]] && break
+    sleep 5
+  done
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+          "http://127.0.0.1:${RANCHER_PROXY_PORT}/dashboard/" || true)"
+  if [[ "$pong" == "pong" && "$code" == "200" ]]; then
+    ok "http://127.0.0.1:${RANCHER_PROXY_PORT}/ping -> pong ; /dashboard/ -> 200"
   else
-    echo "  [!] /ping ne répond pas encore 'pong' (réponse : '${pong:-vide}'). Réessaie dans 1-2 min :"
-    echo "      curl -k --resolve ${RANCHER_HOSTNAME}:443:127.0.0.1 https://${RANCHER_HOSTNAME}/ping"
+    echo "  [!] Rancher ne répond pas encore via le proxy (ping='${pong:-vide}', dashboard=${code:-?})."
+    echo "      kubectl --context $ctx -n cattle-system get pods"
+    echo "      kubectl --context $ctx -n cattle-system logs deploy/rancher-http-proxy --tail=20"
   fi
+}
+
+# =============================================================================
+# 8. Module 5 — clusters fleet-dev / fleet-prod VIDES, à importer dans Rancher
+#    (uniquement avec --only-rancher : jamais branchés au Fleet standalone)
+# =============================================================================
+create_rancher_downstream() {
+  step "8. Clusters à importer dans Rancher (vides)"
+  local t
+  for t in "${TARGETS[@]}"; do create_cluster "${t%%:*}"; done
+  kubectl config use-context "k3d-$RANCHER_CLUSTER" >/dev/null
+  ok "contexte remis sur k3d-$RANCHER_CLUSTER"
 }
 
 # =============================================================================
@@ -417,12 +567,22 @@ summary() {
     echo "  kubectl --context k3d-fleet-prod get pods -A"
   fi
   if $RUN_RANCHER; then
+    kubectl config use-context "k3d-$RANCHER_CLUSTER" >/dev/null
     echo
     echo "Rancher :"
-    echo "  URL          : https://${RANCHER_HOSTNAME}"
+    echo "  Interface    : KodeKloud -> View Port -> ${RANCHER_PROXY_PORT}"
     echo "  Utilisateur  : admin"
-    echo "  Mot de passe : ${RANCHER_BOOTSTRAP_PASSWORD}  (à changer à la 1re connexion)"
-    echo "  Contexte     : kubectl --context k3d-${RANCHER_CLUSTER} get pods -n cattle-system"
+    echo "  Mot de passe : ${RANCHER_BOOTSTRAP_PASSWORD}  (installation neuve ; sinon celui que tu as choisi)"
+    echo "  server-url   : ${RANCHER_SERVER_URL}  (adresse utilisée par les clusters importés)"
+    echo "  Contexte     : $(kubectl config current-context)"
+    if ! $RUN_FLEET; then
+      echo
+      echo "Import (LAB 5b) : Cluster Management -> Import Existing -> Generic -> nom 'dev' -> Create."
+      echo "  Rancher affiche : kubectl apply -f ${RANCHER_SERVER_URL}/v3/import/XXXX.yaml"
+      echo "  La VM ne connaît pas ce nom : remplace-le par 127.0.0.1 et vise le bon cluster :"
+      echo "    curl -s http://127.0.0.1:${RANCHER_PROXY_PORT}/v3/import/XXXX.yaml | kubectl --context k3d-fleet-dev apply -f -"
+      echo "  Puis idem pour 'prod' avec --context k3d-fleet-prod."
+    fi
   fi
   echo
   echo "Fichiers sensibles (ne pas commiter) : $WORK_DIR"
@@ -438,5 +598,8 @@ if $RUN_FLEET; then
   register_targets
   apply_targeting
 fi
-$RUN_RANCHER && install_rancher
+if $RUN_RANCHER; then
+  install_rancher
+  $RUN_FLEET || create_rancher_downstream
+fi
 summary
